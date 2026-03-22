@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # filename: git_sync_manager.py
-# version 1.1.6
+# version 1.1.7
 
 import os
 import sys
@@ -277,7 +277,7 @@ class GitSyncManager:
                     cwd=path, 
                     capture_output=True, 
                     text=True,
-                    stderr=subprocess.DEVNULL   # FIX
+                    stderr=subprocess.DEVNULL
                 )
                 if upstream.returncode != 0:
                     self.log(f"Skipping (no upstream branch): {name}", "warn")
@@ -308,22 +308,22 @@ class GitSyncManager:
                 for g in self.remote_gists: print(f"[Gist] {g['display']} ({g['name']})")
 
             elif action == 'T':
-                print(f"\n{'TYPE':<6} {'NAME':<45} STATUS")
+                print(f"\n{'TYPE':<6} {'STATUS':<10} NAME")
                 for r in self.remote_repos:
                     s = "NEW" if r["name"] in repo_missing else "LOCAL"
-                    print(f"{'Repo':<6} {r['name']:<45} {s}")
+                    print(f"{'Repo':<6} {s:<10} {r['name']}")
                 for g in self.remote_gists:
                     s = "NEW" if g["name"] in gist_missing else "LOCAL"
-                    print(f"{'Gist':<6} {g['display']:<45} {s}")
+                    print(f"{'Gist':<6} {s:<10} {g['display']}")
                 
                 # 2. List Local items that have NO remote (Orphans)
                 orphan_repos = self.local_repos - self.all_remote_repo_names
                 for name in sorted(orphan_repos):
-                    print(f"{'Repo':<6} {name:<45} ORPHAN")
+                    print(f"{'Repo':<6} {'ORPHAN':<10} {name}")
                 
                 orphan_gists = self.local_gists - self.all_remote_gist_names
                 for name in sorted(orphan_gists):
-                    print(f"{'Gist':<6} {name:<45} ORPHAN")
+                    print(f"{'Gist':<6} {'ORPHAN':<10} {name}")
 
             elif action == 'D':
                 o_repos = sorted(list(self.local_repos - self.all_remote_repo_names))
