@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # filename: git_sync_manager.py
-# version 1.0.0
+# version 1.1.6
 
 import os
 import sys
@@ -20,9 +20,12 @@ class GitSyncManager:
         self.target_dir = None
         self.confirm_all = False
         self.dry_run = False
+        self.include_forks = False
 
         self.remote_repos = []
         self.remote_gists = []
+        self.all_remote_repo_names = set()
+        self.all_remote_gist_names = set()
 
         self.local_repos = set()
         self.local_gists = set()
@@ -45,7 +48,8 @@ class GitSyncManager:
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=handlers
+            handlers=handlers,
+            force=True   # FIX: ensure re-init works
         )
 
     def log(self, message, level="info"):
@@ -72,10 +76,11 @@ class GitSyncManager:
         parser.add_argument("--user", help="GitHub Username")
         parser.add_argument("--token", help="GitHub Personal Access Token")
         parser.add_argument("--dir", help="Target local directory")
-        parser.add_argument("--action", choices=['R', 'T', 'C', 'U', 'Q'], help="Default action")
+        parser.add_argument("--action", choices=['R', 'T', 'C', 'U', 'D', 'Q'], help="Default action")
         parser.add_argument("--confirm", action="store_true", help="Skip countdowns")
         parser.add_argument("--no-log", action="store_true", help="Disable file logging")
         parser.add_argument("--dry-run", action="store_true", help="Show commands without executing")
+        parser.add_argument("--include-forks", action="store_true", help="Include forked repositories")
 
         args, _ = parser.parse_known_args()
         self.setup_logging(args.no_log)
@@ -92,13 +97,14 @@ class GitSyncManager:
         self.token = args.token or os.getenv("GITHUB_TOKEN")
         if not self.token:
             self.log("No token detected in environment → public-only mode", "warn")
-            token_input = getpass.getpass("Token (optional, leave blank for public-only): ")
+            token_input = getpass.getpass("Token (optional): ")
             self.token = token_input.strip() or None
 
         self.log("Authenticated mode enabled" if self.token else "Public-only mode")
 
         self.confirm_all = args.confirm
         self.dry_run = args.dry_run
+        self.include_forks = args.include_forks
 
         # Only Gists get a subdirectory
         (self.target_dir / "gists").mkdir(exist_ok=True)
@@ -106,7 +112,7 @@ class GitSyncManager:
         return args.action
 
     # ---------------------------
-    # API
+    # API & State
     # ---------------------------
     def fetch_all_pages(self, url_template):
         results = []
@@ -137,9 +143,7 @@ class GitSyncManager:
                 sys.exit(1)
 
             data = response.json()
-            if not data:
-                break
-
+            if not data: break
             results.extend(data)
             page += 1
 
@@ -152,13 +156,17 @@ class GitSyncManager:
         self.log("Refreshing state from GitHub...")
 
         repos = self.fetch_all_pages(f"https://api.github.com/users/{self.username}/repos")
-        self.remote_repos = [{
-            "name": r["name"],
-            "url": r["clone_url"],
-            "type": "Repo"
-        } for r in repos]
+        self.all_remote_repo_names = {r["name"] for r in repos}
+        
+        # Filter: Skip forks unless --include-forks is used
+        self.remote_repos = [
+            {"name": r["name"], "url": r["clone_url"], "type": "Repo"} 
+            for r in repos if self.include_forks or not r.get("fork")
+        ]
 
         gists = self.fetch_all_pages(f"https://api.github.com/users/{self.username}/gists")
+        self.all_remote_gist_names = {g["id"] for g in gists}
+        
         self.remote_gists = [{
             "name": g["id"],
             "display": g["description"] or f"Gist {g['id'][:8]}",
@@ -170,15 +178,10 @@ class GitSyncManager:
         self.local_repos = {d.name for d in self.target_dir.iterdir() if d.is_dir() and d.name != "gists"}
         self.local_gists = {d.name for d in (self.target_dir / "gists").iterdir() if d.is_dir()}
 
-        remote_repo_names = {r["name"] for r in self.remote_repos}
-        orphan_repos = self.local_repos - remote_repo_names
-        if orphan_repos:
-            self.log(f"{len(orphan_repos)} local repos found with no matching remote", "warn")
-
-        remote_gist_names = {g["name"] for g in self.remote_gists}
-        orphan_gists = self.local_gists - remote_gist_names
-        if orphan_gists:
-            self.log(f"{len(orphan_gists)} local gists found with no matching remote", "warn")
+        # Warning only, listing happens in Table action
+        orphans = (self.local_repos - self.all_remote_repo_names) | (self.local_gists - self.all_remote_gist_names)
+        if orphans:
+            self.log(f"{len(orphans)} total local orphans found (no remote match)", "warn")
 
     def display_summary(self):
         repo_names = {r["name"] for r in self.remote_repos}
@@ -199,7 +202,7 @@ class GitSyncManager:
         return repo_missing, repo_existing, gist_missing, gist_existing
 
     # ---------------------------
-    # Execution Helpers
+    # Git Operations
     # ---------------------------
     def run_git(self, cmd, cwd):
         if self.dry_run:
@@ -209,8 +212,7 @@ class GitSyncManager:
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
             result = subprocess.run(cmd, cwd=cwd)
-            if result.returncode == 0:
-                return True
+            if result.returncode == 0: return True
             if attempt < max_attempts:
                 self.log(f"Git command failed (attempt {attempt}/{max_attempts}), retrying: {' '.join(cmd)}", "warn")
                 time.sleep(1)
@@ -239,7 +241,7 @@ class GitSyncManager:
             # Explicit check for 'gists' repo name collision
             if item["type"] == "Repo" and name.lower() == "gists":
                 print("\n" + "!" * 60)
-                self.log(f"CRITICAL SKIP: Repository named 'gists' detected. Cannot sync to root as it conflicts with the Gist storage directory.", "error")
+                self.log("CRITICAL SKIP: repo named 'gists'", "error")
                 print("!" * 60 + "\n")
                 continue
 
@@ -260,12 +262,23 @@ class GitSyncManager:
                     self.log(f"Skipping update (not a git repo): {name}", "warn")
                     continue
 
-                dirty = subprocess.run(["git", "status", "--porcelain"], cwd=path, capture_output=True, text=True)
+                dirty = subprocess.run(
+                    ["git", "status", "--porcelain"], 
+                    cwd=path, 
+                    capture_output=True, 
+                    text=True
+                )
                 if dirty.stdout.strip():
                     self.log(f"Skipping (local changes present): {name}", "warn")
                     continue
 
-                upstream = subprocess.run(["git", "rev-parse", "--abbrev-ref", "@{u}"], cwd=path, capture_output=True, text=True)
+                upstream = subprocess.run(
+                    ["git", "rev-parse", "--abbrev-ref", "@{u}"], 
+                    cwd=path, 
+                    capture_output=True, 
+                    text=True,
+                    stderr=subprocess.DEVNULL   # FIX
+                )
                 if upstream.returncode != 0:
                     self.log(f"Skipping (no upstream branch): {name}", "warn")
                     continue
@@ -284,7 +297,7 @@ class GitSyncManager:
             repo_missing, repo_existing, gist_missing, gist_existing = self.display_summary()
 
             action = preset_action or input(
-                "\n[R] Remote List | [T] Table | [C] Clone | [U] Update | [Q] Quit\nAction: "
+                "\n[R] Remote List | [T] Table List | [C] Clone | [U] Update | [D] Prune | [Q] Quit\nAction: "
             ).strip().upper()
 
             if action == 'Q':
@@ -302,6 +315,37 @@ class GitSyncManager:
                 for g in self.remote_gists:
                     s = "NEW" if g["name"] in gist_missing else "LOCAL"
                     print(f"{'Gist':<6} {g['display']:<45} {s}")
+                
+                # 2. List Local items that have NO remote (Orphans)
+                orphan_repos = self.local_repos - self.all_remote_repo_names
+                for name in sorted(orphan_repos):
+                    print(f"{'Repo':<6} {name:<45} ORPHAN")
+                
+                orphan_gists = self.local_gists - self.all_remote_gist_names
+                for name in sorted(orphan_gists):
+                    print(f"{'Gist':<6} {name:<45} ORPHAN")
+
+            elif action == 'D':
+                o_repos = sorted(list(self.local_repos - self.all_remote_repo_names))
+                o_gists = sorted(list(self.local_gists - self.all_remote_gist_names))
+                
+                if not o_repos and not o_gists:
+                    print("No orphans to prune.")
+                    continue
+                
+                print("\nORPHANS TO REMOVE:")
+                for n in o_repos: print(f"  [Repo] {n}")
+                for n in o_gists: print(f"  [Gist] {n}")
+                
+                confirm = input(f"\nType 'DELETE' to confirm removal of {len(o_repos) + len(o_gists)} directories: ")
+                if confirm == "DELETE":
+                    for n in o_repos:
+                        self.log(f"Pruning: {n}"); shutil.rmtree(self.target_dir / n)
+                    for n in o_gists:
+                        self.log(f"Pruning Gist: {n}"); shutil.rmtree(self.target_dir / "gists" / n)
+                    self.sync_state()
+                else:
+                    print("Action aborted.")
 
             elif action in ['C', 'U']:
                 mode = "clone" if action == 'C' else "update"
@@ -314,7 +358,6 @@ class GitSyncManager:
                     print(f"\nTargeting {len(r_targets)} repos and {len(g_targets)} gists.")
                     if self.confirm_all or input(f"Proceed with {mode.upper()}? (y/n): ").lower() == 'y':
                         self.countdown()
-                        # Repos target root, Gists target /gists
                         self.process([r for r in self.remote_repos if r["name"] in r_targets], self.target_dir, mode)
                         self.process([g for g in self.remote_gists if g["name"] in g_targets], self.target_dir / "gists", mode)
                         self.sync_state()
@@ -326,5 +369,4 @@ class GitSyncManager:
 
 if __name__ == "__main__":
     mgr = GitSyncManager()
-    initial_action = mgr.get_parameters()
-    mgr.run(initial_action)
+    mgr.run(mgr.get_parameters())
